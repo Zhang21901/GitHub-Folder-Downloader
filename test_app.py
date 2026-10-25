@@ -1,7 +1,9 @@
+import os
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from app import destination_for, parse_github_folder_url, raw_file_url
+from app import api_headers, destination_for, github_token, parse_github_folder_url, raw_file_url
 
 
 class UrlParsingTests(unittest.TestCase):
@@ -29,6 +31,12 @@ class UrlParsingTests(unittest.TestCase):
             raw_file_url(item, "course/编译.pdf"),
             "https://raw.githubusercontent.com/a/repo/main/course/%E7%BC%96%E8%AF%91.pdf",
         )
+
+    def test_uses_environment_token_for_api_requests(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}):
+            github_token.cache_clear()
+            self.assertEqual(api_headers()["Authorization"], "Bearer test-token")
+        github_token.cache_clear()
 
 
 if __name__ == "__main__":

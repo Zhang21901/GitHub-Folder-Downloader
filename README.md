@@ -73,6 +73,17 @@ https://github.com/Fux-i/Learning-In-UESTC/tree/main/3-%E5%A4%A7%E4%BA%8C%E4%B8%
 
 公开仓库会优先使用极速直连下载。遇到 GitHub API 限流、超大仓库目录树或私有仓库时，程序会自动改用 Git 的 sparse checkout。兼容模式需要安装 Git for Windows，速度也可能受 Git 初始化影响。
 
+### 提示 GitHub API rate limit exceeded
+
+匿名 GitHub API 每小时只有 60 次请求额度，校园网、代理或公司网络中的多个用户可能共享同一个出口额度。程序会自动使用本机 GitHub CLI 的登录令牌；已通过 `gh auth login` 登录的用户无需额外设置。
+
+未安装 GitHub CLI 时，也可在启动程序前设置个人访问令牌，程序只在内存中用于 API 请求，不会写入日志或保存到项目目录：
+
+```powershell
+$env:GITHUB_TOKEN = "github_pat_你的令牌"
+python app.py
+```
+
 ### 哪些链接可用？
 
 目前支持 GitHub 文件夹页面链接，即地址中包含 `/tree/分支名/目录路径` 的链接。请复制浏览器地址栏中的链接，而不是文件链接或仓库首页链接。

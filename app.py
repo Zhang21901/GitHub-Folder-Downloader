@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, W, X, filedialog, messagebox, ttk
 import tkinter as tk
@@ -70,9 +72,32 @@ def destination_for(parent: Path, folder_name: str) -> Path:
     return candidate
 
 
+@lru_cache(maxsize=1)
+def github_token() -> str:
+    """Return an optional local token without writing it to disk or logs."""
+    for name in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if token := os.environ.get(name, "").strip():
+            return token
+    if shutil.which("gh"):
+        try:
+            result = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=5, check=False)
+            if result.returncode == 0:
+                return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ""
+
+
+def api_headers() -> dict[str, str]:
+    headers = {"User-Agent": API_USER_AGENT, "Accept": "application/vnd.github+json"}
+    if token := github_token():
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def remote_files(item: GitHubFolder) -> list[dict[str, object]]:
     """List blobs below a public GitHub folder without cloning its repository."""
-    request = Request(item.tree_url, headers={"User-Agent": API_USER_AGENT, "Accept": "application/vnd.github+json"})
+    request = Request(item.tree_url, headers=api_headers())
     for attempt in range(1, NETWORK_ATTEMPTS + 1):
         try:
             with urlopen(request, timeout=30) as response:

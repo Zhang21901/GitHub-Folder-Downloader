@@ -9,16 +9,19 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, W, X, filedialog, messagebox, ttk
 import tkinter as tk
 from urllib.parse import quote, unquote, urlparse
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
 APP_NAME = "GitHub Folder Downloader"
 API_USER_AGENT = "GitHub-Folder-Downloader"
+NETWORK_ATTEMPTS = 3
 
 
 class DirectDownloadError(RuntimeError):
@@ -70,11 +73,15 @@ def destination_for(parent: Path, folder_name: str) -> Path:
 def remote_files(item: GitHubFolder) -> list[dict[str, object]]:
     """List blobs below a public GitHub folder without cloning its repository."""
     request = Request(item.tree_url, headers={"User-Agent": API_USER_AGENT, "Accept": "application/vnd.github+json"})
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except Exception as exc:
-        raise DirectDownloadError(f"无法读取 GitHub 目录清单：{exc}") from exc
+    for attempt in range(1, NETWORK_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+            break
+        except (HTTPError, URLError, OSError) as exc:
+            if attempt == NETWORK_ATTEMPTS:
+                raise DirectDownloadError(f"无法读取 GitHub 目录清单（已重试 {attempt} 次）：{exc}") from exc
+            time.sleep(attempt)
 
     if payload.get("truncated"):
         raise DirectDownloadError("仓库目录树过大，无法使用极速下载。")
@@ -190,14 +197,23 @@ class DownloaderApp(tk.Tk):
         destination = output / Path(path).relative_to(item.folder)
         destination.parent.mkdir(parents=True, exist_ok=True)
         request = Request(raw_file_url(item, path), headers={"User-Agent": API_USER_AGENT})
-        total = 0
-        with urlopen(request, timeout=60) as response, destination.open("wb") as file:
-            while chunk := response.read(1024 * 1024):
-                if self.cancelled:
-                    raise RuntimeError("下载已取消。")
-                file.write(chunk)
-                total += len(chunk)
-        return total
+        for attempt in range(1, NETWORK_ATTEMPTS + 1):
+            total = 0
+            try:
+                with urlopen(request, timeout=60) as response, destination.open("wb") as file:
+                    while chunk := response.read(1024 * 1024):
+                        if self.cancelled:
+                            raise RuntimeError("下载已取消。")
+                        file.write(chunk)
+                        total += len(chunk)
+                return total
+            except (HTTPError, URLError, OSError) as exc:
+                if destination.exists():
+                    destination.unlink()
+                if attempt == NETWORK_ATTEMPTS:
+                    raise RuntimeError(f"文件下载失败（已重试 {attempt} 次）：{path}；{exc}") from exc
+                time.sleep(attempt)
+        raise RuntimeError(f"文件下载失败：{path}")
 
     def _download_direct(self, item: GitHubFolder, target: Path) -> int:
         files = remote_files(item)

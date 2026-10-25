@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem
+      description: Describe what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Paste this type of GitHub folder URL
+        2. Choose a destination
+        3. Click download
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and log
+      description: Include Windows, Python, Git versions, and the relevant app log.
+    validations:
+      required: true

@@ -1,0 +1,28 @@
+import unittest
+from pathlib import Path
+
+from app import destination_for, parse_github_folder_url
+
+
+class UrlParsingTests(unittest.TestCase):
+    def test_parses_directory_url(self):
+        item = parse_github_folder_url("https://github.com/Fux-i/Learning-In-UESTC/tree/main/3-%E5%A4%A7%E4%BA%8C%E4%B8%8A/%E7%BC%96%E8%AF%91%E5%8E%9F%E7%90%86")
+        self.assertEqual(item.owner, "Fux-i")
+        self.assertEqual(item.repository, "Learning-In-UESTC")
+        self.assertEqual(item.branch, "main")
+        self.assertEqual(item.folder, "3-大二上/编译原理")
+
+    def test_rejects_non_folder_url(self):
+        with self.assertRaises(ValueError):
+            parse_github_folder_url("https://github.com/Fux-i/Learning-In-UESTC")
+
+    def test_chooses_unique_destination(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "资料").mkdir()
+            self.assertEqual(destination_for(root, "资料").name, "资料 (2)")
+
+
+if __name__ == "__main__":
+    unittest.main()

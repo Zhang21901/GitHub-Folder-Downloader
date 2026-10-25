@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
-import os
+import concurrent.futures
+import json
 import queue
-import re
 import shutil
 import subprocess
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, W, X, filedialog, messagebox, ttk
 import tkinter as tk
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
+from urllib.request import Request, urlopen
 
 
 APP_NAME = "GitHub Folder Downloader"
+API_USER_AGENT = "GitHub-Folder-Downloader"
+
+
+class DirectDownloadError(RuntimeError):
+    """The public GitHub API download path could not be completed."""
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,11 @@ class GitHubFolder:
     @property
     def clone_url(self) -> str:
         return f"https://github.com/{self.owner}/{self.repository}.git"
+
+    @property
+    def tree_url(self) -> str:
+        branch = quote(self.branch, safe="")
+        return f"https://api.github.com/repos/{self.owner}/{self.repository}/git/trees/{branch}?recursive=1"
 
     @property
     def folder_name(self) -> str:
@@ -55,6 +67,30 @@ def destination_for(parent: Path, folder_name: str) -> Path:
     return candidate
 
 
+def remote_files(item: GitHubFolder) -> list[dict[str, object]]:
+    """List blobs below a public GitHub folder without cloning its repository."""
+    request = Request(item.tree_url, headers={"User-Agent": API_USER_AGENT, "Accept": "application/vnd.github+json"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except Exception as exc:
+        raise DirectDownloadError(f"无法读取 GitHub 目录清单：{exc}") from exc
+
+    if payload.get("truncated"):
+        raise DirectDownloadError("仓库目录树过大，无法使用极速下载。")
+    prefix = item.folder.rstrip("/") + "/"
+    files = [entry for entry in payload.get("tree", [])
+             if entry.get("type") == "blob" and str(entry.get("path", "")).startswith(prefix)]
+    if not files:
+        raise DirectDownloadError("未在 GitHub 中找到目标文件夹。")
+    return files
+
+
+def raw_file_url(item: GitHubFolder, path: str) -> str:
+    return "https://raw.githubusercontent.com/{}/{}/{}/{}".format(
+        item.owner, item.repository, quote(item.branch, safe=""), quote(path, safe="/"))
+
+
 class DownloaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -75,7 +111,7 @@ class DownloaderApp(tk.Tk):
         root = ttk.Frame(self, padding=22)
         root.pack(fill=BOTH, expand=True)
         ttk.Label(root, text="GitHub 文件夹下载器", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor=W)
-        ttk.Label(root, text="只下载仓库中指定的一个文件夹，不需要下载完整仓库。", foreground="#505a68").pack(anchor=W, pady=(5, 20))
+        ttk.Label(root, text="仅下载指定文件夹；公开仓库默认使用极速直连下载。", foreground="#505a68").pack(anchor=W, pady=(5, 20))
 
         ttk.Label(root, text="GitHub 文件夹链接").pack(anchor=W)
         self.url_entry = ttk.Entry(root, textvariable=self.url_var)
@@ -122,8 +158,6 @@ class DownloaderApp(tk.Tk):
             parent = Path(self.location_var.get()).expanduser()
             if not parent.is_dir():
                 raise ValueError("请选择一个已存在的保存位置。")
-            if shutil.which("git") is None:
-                raise ValueError("未找到 Git。请安装 Git for Windows 后重试：https://git-scm.com/download/win")
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
@@ -150,20 +184,80 @@ class DownloaderApp(tk.Tk):
         if code:
             raise RuntimeError(f"命令执行失败（退出代码 {code}）。")
 
-    def _download(self, item: GitHubFolder, parent: Path) -> None:
-        target = destination_for(parent, item.folder_name)
+    def _download_file(self, item: GitHubFolder, path: str, output: Path) -> int:
+        if self.cancelled:
+            raise RuntimeError("下载已取消。")
+        destination = output / Path(path).relative_to(item.folder)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        request = Request(raw_file_url(item, path), headers={"User-Agent": API_USER_AGENT})
+        total = 0
+        with urlopen(request, timeout=60) as response, destination.open("wb") as file:
+            while chunk := response.read(1024 * 1024):
+                if self.cancelled:
+                    raise RuntimeError("下载已取消。")
+                file.write(chunk)
+                total += len(chunk)
+        return total
+
+    def _download_direct(self, item: GitHubFolder, target: Path) -> int:
+        files = remote_files(item)
+        total_bytes = sum(int(entry.get("size", 0)) for entry in files)
+        self.events.put(("status", f"极速下载：准备下载 {len(files)} 个文件..."))
+        stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.downloading-", dir=target.parent))
+        content = stage / "content"
+        content.mkdir()
+        completed = 0
+        downloaded_bytes = 0
         try:
-            self.events.put(("status", "正在准备下载..."))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(self._download_file, item, str(entry["path"]), content) for entry in files]
+                for future in concurrent.futures.as_completed(futures):
+                    downloaded_bytes += future.result()
+                    completed += 1
+                    self.events.put(("status", f"极速下载：{completed}/{len(files)} 个文件，{downloaded_bytes / 1024 / 1024:.1f}/{total_bytes / 1024 / 1024:.1f} MB"))
+            content.replace(target)
+            return completed
+        except Exception as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            if self.cancelled:
+                raise RuntimeError("下载已取消。") from exc
+            raise DirectDownloadError(str(exc)) from exc
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+
+    def _download_with_git(self, item: GitHubFolder, target: Path) -> int:
+        if shutil.which("git") is None:
+            raise RuntimeError("极速下载不可用，且未找到 Git。请安装 Git for Windows 后重试：https://git-scm.com/download/win")
+        stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.git-", dir=target.parent))
+        repository = stage / "repository"
+        try:
+            self.events.put(("status", "正在使用 Git 兼容模式下载..."))
             self._run(["git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--branch", item.branch,
-                       item.clone_url, str(target)])
-            self.events.put(("status", "正在获取指定文件夹..."))
-            self._run(["git", "-C", str(target), "sparse-checkout", "set", "--no-cone", item.folder])
-            self._run(["git", "-C", str(target), "checkout", item.branch])
-            downloaded = target / item.folder
+                       item.clone_url, str(repository)])
+            self._run(["git", "-C", str(repository), "sparse-checkout", "set", "--no-cone", item.folder])
+            self._run(["git", "-C", str(repository), "checkout", item.branch])
+            downloaded = repository / item.folder
             if not downloaded.is_dir():
                 raise RuntimeError("未找到目标文件夹；请检查链接是否正确。")
             count = sum(1 for path in downloaded.rglob("*") if path.is_file())
-            self.events.put(("success", f"下载完成：{downloaded}\n共下载 {count} 个文件。"))
+            downloaded.replace(target)
+            return count
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+
+    def _download(self, item: GitHubFolder, parent: Path) -> None:
+        target = destination_for(parent, item.folder_name)
+        try:
+            try:
+                count = self._download_direct(item, target)
+                mode = "极速直连"
+            except DirectDownloadError as exc:
+                self.events.put(("log", f"极速下载不可用，切换至 Git 兼容模式：{exc}"))
+                count = self._download_with_git(item, target)
+                mode = "Git 兼容模式"
+            self.events.put(("success", f"下载完成（{mode}）：{target}\n共下载 {count} 个文件。"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
 

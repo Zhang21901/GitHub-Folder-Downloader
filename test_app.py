@@ -1,7 +1,7 @@
 import unittest
 from pathlib import Path
 
-from app import destination_for, parse_github_folder_url
+from app import destination_for, parse_github_folder_url, raw_file_url
 
 
 class UrlParsingTests(unittest.TestCase):
@@ -22,6 +22,13 @@ class UrlParsingTests(unittest.TestCase):
             root = Path(tmp)
             (root / "资料").mkdir()
             self.assertEqual(destination_for(root, "资料").name, "资料 (2)")
+
+    def test_builds_encoded_raw_file_url(self):
+        item = parse_github_folder_url("https://github.com/a/repo/tree/main/course/%E7%BC%96%E8%AF%91.pdf")
+        self.assertEqual(
+            raw_file_url(item, "course/编译.pdf"),
+            "https://raw.githubusercontent.com/a/repo/main/course/%E7%BC%96%E8%AF%91.pdf",
+        )
 
 
 if __name__ == "__main__":

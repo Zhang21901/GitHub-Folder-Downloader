@@ -10,7 +10,8 @@
 
 ## 功能
 
-- 仅下载 GitHub 仓库中指定的目录
+- 仅下载 GitHub 仓库中指定的目录，不再保留 `.git` 元数据
+- 公开仓库默认采用 8 路并发直连下载，减少 Git 初始化和解压等待
 - 图形界面，无需手动输入 Git 命令
 - 支持中文和 URL 编码路径
 - 显示实时下载日志、成功状态和错误信息
@@ -68,9 +69,9 @@ https://github.com/Fux-i/Learning-In-UESTC/tree/main/3-%E5%A4%A7%E4%BA%8C%E4%B8%
 
 安装 Git for Windows 后，关闭并重新打开程序。
 
-### 下载结果比预期多出 `.git` 文件夹
+### 为什么会切换到 Git 兼容模式？
 
-这是 Git 为记录下载来源和支持后续更新而创建的元数据目录。它不会影响资料的正常打开；如果确认不再需要更新，可以手动删除 `.git` 文件夹。
+公开仓库会优先使用极速直连下载。遇到 GitHub API 限流、超大仓库目录树或私有仓库时，程序会自动改用 Git 的 sparse checkout。兼容模式需要安装 Git for Windows，速度也可能受 Git 初始化影响。
 
 ### 哪些链接可用？
 
@@ -78,7 +79,7 @@ https://github.com/Fux-i/Learning-In-UESTC/tree/main/3-%E5%A4%A7%E4%BA%8C%E4%B8%
 
 ## 原理
 
-本工具调用 Git 的 partial clone 与 `sparse-checkout`。它先获取仓库元数据，再仅把用户指定的路径检出到本地工作区。
+公开仓库默认通过 GitHub API 获取目录树，再以 8 路并发方式下载该目录的原始文件。API 不可用时，工具调用 Git 的 partial clone 与 `sparse-checkout` 作为备用路径。
 
 ## 开发
 

@@ -51,6 +51,13 @@ class GitHubFolder:
         return Path(self.folder).name
 
 
+@dataclass(frozen=True)
+class DownloadTask:
+    task_id: int
+    item: GitHubFolder
+    parent: Path
+
+
 def parse_github_folder_url(url: str) -> GitHubFolder:
     """Parse the usual GitHub directory URL, with a one-segment branch name."""
     parsed = urlparse(url.strip())
@@ -127,9 +134,14 @@ class DownloaderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_NAME)
-        self.minsize(760, 530)
-        self.geometry("820x580")
-        self.events: queue.Queue[tuple[str, str | int]] = queue.Queue()
+        self.minsize(820, 690)
+        self.geometry("900x740")
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.download_queue: queue.Queue[DownloadTask] = queue.Queue()
+        self.task_rows: dict[int, str] = {}
+        self.removed_task_ids: set[int] = set()
+        self.next_task_id = 1
+        self.active_task_id: int | None = None
         self.active_process: subprocess.Popen[str] | None = None
         self.cancelled = False
 
@@ -138,6 +150,7 @@ class DownloaderApp(tk.Tk):
         self.status_var = tk.StringVar(value="粘贴 GitHub 文件夹链接，然后选择保存位置。")
         self._build()
         self.after(100, self._consume_events)
+        threading.Thread(target=self._queue_worker, daemon=True).start()
 
     def _build(self) -> None:
         root = ttk.Frame(self, padding=22)
@@ -160,17 +173,29 @@ class DownloaderApp(tk.Tk):
 
         actions = ttk.Frame(root)
         actions.pack(fill=X, pady=(0, 12))
-        self.download_button = ttk.Button(actions, text="开始下载", command=self._start_download)
+        self.download_button = ttk.Button(actions, text="加入下载队列", command=self._start_download)
         self.download_button.pack(side=LEFT)
-        self.cancel_button = ttk.Button(actions, text="取消", command=self._cancel, state="disabled")
+        self.cancel_button = ttk.Button(actions, text="取消当前任务", command=self._cancel, state="disabled")
         self.cancel_button.pack(side=LEFT, padx=(8, 0))
+        self.remove_button = ttk.Button(actions, text="移除选中等待任务", command=self._remove_selected)
+        self.remove_button.pack(side=LEFT, padx=(8, 0))
+
+        ttk.Label(root, text="下载队列（按添加顺序执行）").pack(anchor=W, pady=(4, 6))
+        self.task_table = ttk.Treeview(root, columns=("folder", "location", "status"), show="headings", height=7)
+        self.task_table.heading("folder", text="文件夹")
+        self.task_table.heading("location", text="保存位置")
+        self.task_table.heading("status", text="状态")
+        self.task_table.column("folder", width=170, anchor=W)
+        self.task_table.column("location", width=440, anchor=W)
+        self.task_table.column("status", width=170, anchor=W)
+        self.task_table.pack(fill=X, pady=(0, 12))
 
         self.progress = ttk.Progressbar(root, mode="indeterminate")
         self.progress.pack(fill=X, pady=(0, 12))
         ttk.Label(root, textvariable=self.status_var).pack(anchor=W)
 
-        ttk.Label(root, text="下载日志").pack(anchor=W, pady=(18, 6))
-        self.log = tk.Text(root, height=13, wrap="word", state="disabled", font=("Consolas", 9))
+        ttk.Label(root, text="下载日志").pack(anchor=W, pady=(12, 6))
+        self.log = tk.Text(root, height=10, wrap="word", state="disabled", font=("Consolas", 9))
         self.log.pack(fill=BOTH, expand=True)
 
     def _choose_location(self) -> None:
@@ -194,21 +219,60 @@ class DownloaderApp(tk.Tk):
             messagebox.showerror(APP_NAME, str(exc))
             return
 
-        self.cancelled = False
-        self.download_button.configure(state="disabled")
-        self.browse_button.configure(state="disabled")
-        self.cancel_button.configure(state="normal")
-        self.progress.start(12)
-        self._append_log(f"链接：{item.clone_url}，目录：{item.folder}")
-        threading.Thread(target=self._download, args=(item, parent), daemon=True).start()
+        task = DownloadTask(self.next_task_id, item, parent)
+        self.next_task_id += 1
+        target = destination_for(parent, item.folder_name)
+        row = self.task_table.insert("", END, values=(item.folder, str(target), "等待中"))
+        self.task_rows[task.task_id] = row
+        self.download_queue.put(task)
+        self._append_log(f"已加入队列：{item.clone_url}，目录：{item.folder}")
+        self.status_var.set(f"已加入队列，等待任务数：{self.download_queue.qsize()}。")
+
+    def _remove_selected(self) -> None:
+        selected = self.task_table.selection()
+        if not selected:
+            return
+        row = selected[0]
+        task_id = next((key for key, value in self.task_rows.items() if value == row), None)
+        if task_id is None or task_id == self.active_task_id:
+            messagebox.showinfo(APP_NAME, "当前正在下载的任务请使用“取消当前任务”。")
+            return
+        values = self.task_table.item(row, "values")
+        if values and values[2] == "等待中":
+            self.removed_task_ids.add(task_id)
+            self.task_table.delete(row)
+            del self.task_rows[task_id]
+            self.status_var.set("已移除等待任务。")
+
+    def _task_event(self, kind: str, value: str) -> None:
+        if self.active_task_id is not None:
+            self.events.put((kind, (self.active_task_id, value)))
+
+    def _queue_worker(self) -> None:
+        while True:
+            task = self.download_queue.get()
+            if task.task_id in self.removed_task_ids:
+                self.download_queue.task_done()
+                continue
+            self.active_task_id = task.task_id
+            self.cancelled = False
+            self.events.put(("task_started", task.task_id))
+            try:
+                mode, target, count = self._download(task.item, task.parent)
+                self.events.put(("task_finished", (task.task_id, True, f"完成（{mode}，{count} 个文件）", str(target))))
+            except Exception as exc:
+                self.events.put(("task_finished", (task.task_id, False, f"失败：{exc}", "")))
+            finally:
+                self.active_task_id = None
+                self.download_queue.task_done()
 
     def _run(self, args: list[str], cwd: Path | None = None) -> None:
-        self.events.put(("log", "$ " + subprocess.list2cmdline(args)))
+        self._task_event("task_log", "$ " + subprocess.list2cmdline(args))
         self.active_process = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                                text=True, encoding="utf-8", errors="replace")
         assert self.active_process.stdout is not None
         for line in self.active_process.stdout:
-            self.events.put(("log", line))
+            self._task_event("task_log", line)
         code = self.active_process.wait()
         self.active_process = None
         if self.cancelled:
@@ -243,7 +307,7 @@ class DownloaderApp(tk.Tk):
     def _download_direct(self, item: GitHubFolder, target: Path) -> int:
         files = remote_files(item)
         total_bytes = sum(int(entry.get("size", 0)) for entry in files)
-        self.events.put(("status", f"极速下载：准备下载 {len(files)} 个文件..."))
+        self._task_event("task_status", f"极速下载：准备下载 {len(files)} 个文件...")
         stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.downloading-", dir=target.parent))
         content = stage / "content"
         content.mkdir()
@@ -255,7 +319,7 @@ class DownloaderApp(tk.Tk):
                 for future in concurrent.futures.as_completed(futures):
                     downloaded_bytes += future.result()
                     completed += 1
-                    self.events.put(("status", f"极速下载：{completed}/{len(files)} 个文件，{downloaded_bytes / 1024 / 1024:.1f}/{total_bytes / 1024 / 1024:.1f} MB"))
+                    self._task_event("task_status", f"极速下载：{completed}/{len(files)} 个文件，{downloaded_bytes / 1024 / 1024:.1f}/{total_bytes / 1024 / 1024:.1f} MB")
             content.replace(target)
             return completed
         except Exception as exc:
@@ -273,7 +337,7 @@ class DownloaderApp(tk.Tk):
         stage = Path(tempfile.mkdtemp(prefix=f".{target.name}.git-", dir=target.parent))
         repository = stage / "repository"
         try:
-            self.events.put(("status", "正在使用 Git 兼容模式下载..."))
+            self._task_event("task_status", "正在使用 Git 兼容模式下载...")
             self._run(["git", "clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--branch", item.branch,
                        item.clone_url, str(repository)])
             self._run(["git", "-C", str(repository), "sparse-checkout", "set", "--no-cone", item.folder])
@@ -288,19 +352,16 @@ class DownloaderApp(tk.Tk):
             if stage.exists():
                 shutil.rmtree(stage, ignore_errors=True)
 
-    def _download(self, item: GitHubFolder, parent: Path) -> None:
+    def _download(self, item: GitHubFolder, parent: Path) -> tuple[str, Path, int]:
         target = destination_for(parent, item.folder_name)
         try:
-            try:
-                count = self._download_direct(item, target)
-                mode = "极速直连"
-            except DirectDownloadError as exc:
-                self.events.put(("log", f"极速下载不可用，切换至 Git 兼容模式：{exc}"))
-                count = self._download_with_git(item, target)
-                mode = "Git 兼容模式"
-            self.events.put(("success", f"下载完成（{mode}）：{target}\n共下载 {count} 个文件。"))
-        except Exception as exc:
-            self.events.put(("error", str(exc)))
+            count = self._download_direct(item, target)
+            mode = "极速直连"
+        except DirectDownloadError as exc:
+            self._task_event("task_log", f"极速下载不可用，切换至 Git 兼容模式：{exc}")
+            count = self._download_with_git(item, target)
+            mode = "Git 兼容模式"
+        return mode, target, count
 
     def _cancel(self) -> None:
         self.cancelled = True
@@ -308,30 +369,42 @@ class DownloaderApp(tk.Tk):
             self.active_process.terminate()
         self.status_var.set("正在取消下载...")
 
-    def _finish(self) -> None:
-        self.progress.stop()
-        self.download_button.configure(state="normal")
-        self.browse_button.configure(state="normal")
-        self.cancel_button.configure(state="disabled")
-
     def _consume_events(self) -> None:
         try:
             while True:
                 kind, value = self.events.get_nowait()
-                if kind == "log":
-                    self._append_log(str(value))
-                elif kind == "status":
-                    self.status_var.set(str(value))
-                elif kind == "success":
-                    self._finish()
-                    self.status_var.set("下载完成。")
-                    self._append_log(str(value))
-                    messagebox.showinfo(APP_NAME, str(value))
-                elif kind == "error":
-                    self._finish()
-                    self.status_var.set("下载未完成。")
-                    self._append_log("错误：" + str(value))
-                    messagebox.showerror(APP_NAME, str(value))
+                if kind == "task_started":
+                    task_id = int(value)
+                    row = self.task_rows.get(task_id)
+                    if row:
+                        values = list(self.task_table.item(row, "values"))
+                        values[2] = "下载中"
+                        self.task_table.item(row, values=values)
+                    self.progress.start(12)
+                    self.cancel_button.configure(state="normal")
+                    self.status_var.set("正在下载队列中的下一个任务...")
+                elif kind in {"task_status", "task_log"}:
+                    task_id, text = value  # type: ignore[misc]
+                    row = self.task_rows.get(task_id)
+                    if kind == "task_status" and row:
+                        values = list(self.task_table.item(row, "values"))
+                        values[2] = str(text)
+                        self.task_table.item(row, values=values)
+                        self.status_var.set(str(text))
+                    elif kind == "task_log":
+                        self._append_log(str(text))
+                elif kind == "task_finished":
+                    task_id, succeeded, status, target = value  # type: ignore[misc]
+                    row = self.task_rows.get(task_id)
+                    if row:
+                        values = list(self.task_table.item(row, "values"))
+                        values[1] = str(target) or values[1]
+                        values[2] = str(status)
+                        self.task_table.item(row, values=values)
+                    self.progress.stop()
+                    self.cancel_button.configure(state="disabled")
+                    self.status_var.set("任务完成，正在等待下一个任务。" if succeeded else "任务失败，正在继续队列。")
+                    self._append_log(str(status))
         except queue.Empty:
             pass
         self.after(100, self._consume_events)

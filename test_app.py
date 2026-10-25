@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app import api_headers, destination_for, github_token, parse_github_folder_url, raw_file_url
+from app import DownloadTask, api_headers, destination_for, github_token, parse_github_folder_url, raw_file_url
 
 
 class UrlParsingTests(unittest.TestCase):
@@ -37,6 +37,13 @@ class UrlParsingTests(unittest.TestCase):
             github_token.cache_clear()
             self.assertEqual(api_headers()["Authorization"], "Bearer test-token")
         github_token.cache_clear()
+
+    def test_download_task_preserves_queue_order_data(self):
+        item = parse_github_folder_url("https://github.com/a/repo/tree/main/folder")
+        task = DownloadTask(7, item, Path("C:/Downloads"))
+        self.assertEqual(task.task_id, 7)
+        self.assertEqual(task.item.folder_name, "folder")
+        self.assertEqual(task.parent, Path("C:/Downloads"))
 
 
 if __name__ == "__main__":
